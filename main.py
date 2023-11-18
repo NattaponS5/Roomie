@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Depends, Header, Cookie
+from fastapi import FastAPI, HTTPException, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from fastapi.security import OAuth2PasswordBearer
@@ -74,6 +74,9 @@ class Booking(BaseModel):
 class Cancellation(BaseModel):
     BookingID: int
     Timestamp: datetime
+
+class Warning(BaseModel):
+    TimeStamp: datetime
 
 # to def get_current_admin
 def authenticate_admin(username: str, password: str):
@@ -254,10 +257,11 @@ async def user_signout(current_user_type: Optional[str] = Depends(get_user_type)
     # Perform any other necessary logout actions
     return {"message": "Logout successful", "user_type": None}
 
-@app.get("showuser")
+@app.get("/showuser")
 def show_user(
     user_type: str = Depends(get_user_type)
 ):
+    print(f"User_Type: {user_type}") #test
     if user_type != "admin":
         raise HTTPException(status_code=403, detail="Permission denied. Only admins can access this endpoint.")
 
@@ -389,6 +393,23 @@ def cancel_book(
             return {"message": "Room Booking cancelled successfully by Admin"}
         except Exception as e:
             return HTTPException(status_code=500, detail=str(e))
+        
+@app.post("/confirmbook")
+def confirm_book(
+    user_type: str = Depends(get_user_type)
+):
+    if user_type == "admin":
+        try:
+            # Update booking data in the MySQL database
+            query = "UPDATE booking SET Status = %s WHERE BookingID = %s"
+            values = ('Confirmed', Booking.BookingID)
+            cursor.execute(query, values)
+            db.commit()
+            return {"message": "Room Booking confirmed successfully by Admin"}
+        except Exception as e:
+            return HTTPException(status_code=500, detail=str(e))
+    else:
+        return HTTPException(status_code=401, detail="Invalid user type")
     
     
 @app.get("/showbookings")
@@ -410,6 +431,50 @@ def show_bookings(
         try:
             user_id = current_user['user_details']['UserID']
             query = "SELECT * FROM booking WHERE UserID = %s"
+            cursor.execute(query, (user_id,))
+            result = cursor.fetchall()
+            return result
+        except Exception as e:
+            return HTTPException(status_code=500, detail=str(e))
+    else:
+        return HTTPException(status_code=401, detail="Invalid user type")
+    
+@app.post("/addwarning")
+def add_warning(
+    user_type: str = Depends(get_user_type)
+):
+    if user_type != "admin":
+        raise HTTPException(status_code=403, detail="Permission denied. Only admins can access this endpoint.")
+    try:
+        # Insert warning data into the MySQL database
+        query = "INSERT INTO warning (UserID, Timestamp) VALUES (%s, %s)"
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        values = (Warning.UserID, timestamp)
+        cursor.execute(query, values)
+        db.commit()
+        return {"message": "New Warning created successfully by User"}
+    except Exception as e:
+        return HTTPException(status_code=500, detail=str(e))
+    
+@app.post("/showwarnings")
+def show_warnings(
+    current_user: dict = Depends(get_current_user),
+    user_type: str = Depends(get_user_type)
+):
+    if user_type == "admin":
+        # Display all warnings for admin
+        try:
+            query = "SELECT * FROM warning"
+            cursor.execute(query)
+            result = cursor.fetchall()
+            return result
+        except Exception as e:
+            return HTTPException(status_code=500, detail=str(e))
+    elif user_type == "user":
+        # Display only the warnings for the current user
+        try:
+            user_id = current_user['user_details']['UserID']
+            query = "SELECT * FROM warning WHERE UserID = %s"
             cursor.execute(query, (user_id,))
             result = cursor.fetchall()
             return result
