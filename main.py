@@ -1,10 +1,11 @@
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, Header, Cookie
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from fastapi.security import OAuth2PasswordBearer
 from typing import Optional
 import mysql.connector
 from typing import Union
+from datetime import datetime
 
 app = FastAPI()
 
@@ -45,14 +46,36 @@ class Admin(BaseModel):
     LastName: str
     Email: str
     Username: str
-    Password: str  
+    Password: str
 
 # Pydantic model for the login request
 class UserLogin(BaseModel):
     Username: str
     Password: str
 
+# Pydantic model for the room request
+class Room(BaseModel):
+    # fill the one that is not auto increment
+    AdminID: str
+    RoomName: str
+    RoomType: str
+    Description: str
+    Availability: bool
 
+class Booking(BaseModel):
+    UserID: int
+    RoomID: int
+    AdminID: int
+    StartTime: datetime
+    EndTime: datetime
+    Status: str
+    Timestamp: datetime
+
+class Cancellation(BaseModel):
+    BookingID: int
+    Timestamp: datetime
+
+# to def get_current_admin
 def authenticate_admin(username: str, password: str):
     # Check if the provided username and password match an existing admin in the database
     check_query = "SELECT * FROM admin WHERE Username = %s AND Password = %s"
@@ -61,17 +84,21 @@ def authenticate_admin(username: str, password: str):
     existing_admin = cursor.fetchone()
 
     if existing_admin:
-        return True
-    return False
+        return existing_admin  # Return the admin details
+    return None
 
 # Dependency to check if the request is coming from a valid admin
-def get_current_admin(username: str = Depends(lambda x: x.headers.get("username")),
+# to @app.post("/signupadmin")
+def get_current_admin(username: str = Depends(lambda x: x.headers.get("username")), 
                       password: str = Depends(lambda x: x.headers.get("password"))):
-    if not authenticate_admin(username, password):
-        raise HTTPException(status_code=401, detail="Invalid admin credentials")
-    return True
+    admin_details = authenticate_admin(username, password)
+    if admin_details:
+        return {"user_type": "admin", "user_details": admin_details}
+    
+    raise HTTPException(status_code=401, detail="Invalid admin credentials")
 
-def authenticate_user(username: str, password: str, user_type: str):
+# to def get_current_user 
+def authenticate_user(username: str, password: str, user_type: str): 
     # Check if the provided username and password match a user in the specified database
     check_query = "SELECT * FROM {} WHERE Username = %s AND Password = %s".format(user_type)
     check_values = (username, password)
@@ -82,20 +109,46 @@ def authenticate_user(username: str, password: str, user_type: str):
         return user_type  # Return the user type (admin or user)
     return None
 
+# to async def get_user_type
+def extract_user_type(authorization: str) -> str:
+    # Extract the user type from the authorization header
+    user_type = authorization.split(" ")[0]
+    return user_type
+
+# to def get_current_user, @app.post("/logout")
+async def get_user_type(authorization: Optional[str] = Header(None)):
+    if authorization is None:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    user_type = extract_user_type(authorization)
+
+    if user_type not in ["admin", "user"]:
+        raise HTTPException(status_code=401, detail="Invalid user type")
+
+    return user_type
+    #return admin or user
+
+# to @app.post("/signupadmin"), @app.get("/showuser"), @app.get("/showroom")
 # Dependency to check if the request is coming from a valid admin
-def get_current_user(login_data: UserLogin = Depends()):
+def get_current_user(user_type: str = Depends(get_user_type), login_data: UserLogin = Depends()):
     username = login_data.Username
     password = login_data.Password
 
-    admin_auth = authenticate_user(username, password, "admin")
-    if admin_auth:
-        return {"user_type": "admin", "user_details": admin_auth[1]}
-    
-    user_auth = authenticate_user(username, password, "user")
-    if user_auth:
-        return {"user_type": "user", "user_details": user_auth[1]}
-    
+    if user_type == "admin":
+        admin_auth = authenticate_user(username, password, "admin")
+        if admin_auth:
+            return {"user_type": "admin", "user_details": admin_auth[1]}
+    elif user_type == "user":
+        user_auth = authenticate_user(username, password, "user")
+        if user_auth:
+            return {"user_type": "user", "user_details": user_auth[1]}
+        
     raise HTTPException(status_code=401, detail="Invalid credentials")
+    #from get_user_type, authenicate_user, return admin or user in details
+
+@app.post("/signout")
+def remove_current_user():
+    return {"user_type": None, "user_details": None}
 
 @app.post("/signupadmin", dependencies=[Depends(get_current_admin)])
 def signupadmin(admin: Admin):
@@ -160,13 +213,15 @@ def login(credentials: UserLogin, db_config: dict) -> Union[User, Admin, None]:
         cursor.execute("SELECT * FROM user WHERE Username = %s AND Password = %s", (credentials.Username, credentials.Password))
         user_data = cursor.fetchone()
         if user_data:
-            return User(**user_data)
+            # Return a dictionary with user details
+            return {"user_type": "user", "user_details": user_data}
 
         # Check if the provided username and password match the admin data
         cursor.execute("SELECT * FROM admin WHERE Username = %s AND Password = %s", (credentials.Username, credentials.Password))
         admin_data = cursor.fetchone()
         if admin_data:
-            return Admin(**admin_data)
+            # Return a dictionary with admin details
+            return {"user_type": "admin", "user_details": admin_data}
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Internal Server Error: {str(e)}")
@@ -178,100 +233,52 @@ def login(credentials: UserLogin, db_config: dict) -> Union[User, Admin, None]:
         if connection and connection.is_connected():
             connection.close()
 
-@app.post("/login")
-async def user_login(credentials: UserLogin):
-    user = login(credentials, db_config)
+
+@app.post("/signin")
+async def user_signin(credentials: UserLogin):
+    user_data = login(credentials, db_config)
     
-    if user is None:
+    if user_data is None:
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
-    return {"message": f"Welcome, {user.FirstName} {user.LastName}!"}
+    if user_data.get("user_type") == "admin":
+        return {"message": f"Welcome, Admin {user_data['user_details']['Username']}!"}
+    elif user_data.get("user_type") == "user":
+        return {"message": f"Welcome, {user_data['user_details']['FirstName']} {user_data['user_details']['LastName']}!"}
 
-@app.get("/showuser")
-def show_user(current_user: dict = Depends(get_current_user)):
-    user_type = current_user['user_type']
-    user_details = current_user['user_details']
+@app.post("signout")
+async def user_signout(current_user_type: Optional[str] = Depends(get_user_type)):
+    if current_user_type is None:
+        raise HTTPException(status_code=401, detail="User not logged in")
 
-    if user_type == "admin":
-        # Display admin information or perform admin-specific actions
-        return {"message": f"Displaying admin information: {user_details}"}
-    elif user_type == "user":
-        # Display user information or perform user-specific actions
-        return {"message": f"Displaying user information: {user_details}"}
+    # Perform any other necessary logout actions
+    return {"message": "Logout successful", "user_type": None}
 
+@app.get("showuser")
+def show_user(
+    user_type: str = Depends(get_user_type)
+):
+    if user_type != "admin":
+        raise HTTPException(status_code=403, detail="Permission denied. Only admins can access this endpoint.")
 
-# Pydantic model for the reservation request
-class Booking(BaseModel):
-    BookingID: str
-    UserID: str
-    RoomID: str
-    AdminID: str
-    StartTime: str
-    EndTime: str
-    Status: str
-    Timestamp:str
-
-
-@app.post("/booking")
-def booking(booking: Booking):
     try:
-        # Insert reservation data into the MySQL database
-        query = "INSERT INTO booking(StartTime, EndTime, Status, TimeStamp) VALUES (%s, %s, %s, %s)"
-        values = (booking.StartTime, booking.EndTime, booking.Status, Booking.TimeStamp)
-        cursor.execute(query, values)
-        db.commit()
-        return {"message": "Reservation created successfully"}
-    except Exception as e:
-        return HTTPException(status_code=500, detail=str(e))
-    
-@app.get("/showbooking")
-def bookings():
-    try:
-        # Get all reservations from the MySQL database
-        query = "SELECT * FROM booking"
+        query = "SELECT * FROM users"
         cursor.execute(query)
         result = cursor.fetchall()
         return result
     except Exception as e:
         return HTTPException(status_code=500, detail=str(e))
-    
-@app.post("/cancelroom")
-def cancel_room(booking_id: str):
-    try:
-        # Check if the booking exists in the database
-        check_query = "SELECT * FROM booking WHERE BookingID = %s"
-        check_values = (booking_id,)
-        cursor.execute(check_query, check_values)
-        existing_booking = cursor.fetchone()
 
-        if existing_booking:
-            # Update the booking status to 'canceled'
-            update_query = "UPDATE booking SET Status = 'canceled' WHERE BookingID = %s"
-            update_values = (booking_id,)
-            cursor.execute(update_query, update_values)
-            db.commit()
-            return {"message": f"Booking {booking_id} canceled successfully"}
-        else:
-            return HTTPException(status_code=404, detail=f"Booking {booking_id} not found")
-    except Exception as e:
-        return HTTPException(status_code=500, detail=str(e))
-
-# Pydantic model for the room request
-class Room(BaseModel):
-    RoomID: int
-    AdminID: int
-    RoomName: str
-    RoomType: str
-    Description: str
-    Availability: bool
-
-
-@app.post("/room")
-def room(room: Room):
+@app.post("/addroom")
+def add_room(
+    user_type: str = Depends(get_user_type)
+):
+    if user_type != "admin":
+        raise HTTPException(status_code=403, detail="Permission denied. Only admins can access this endpoint.")
     try:
         # Insert room data into the MySQL database
-        query = "INSERT INTO room (RoomName, RoomType, Description , Availability) VALUES (%s, %s, %s, %s)"
-        values = (room.RoomName, room.RoomType, room.Description, room.Availability)
+        query = "INSERT INTO room (AdminID, RoomName, RoomType, Description, Availability) VALUES (%s, %s, %s, %s, %s)"
+        values = (Room.AdminID, Room.RoomName, Room.RoomType, Room.Description, Room.Availability)
         cursor.execute(query, values)
         db.commit()
         return {"message": "New Room created successfully"}
@@ -279,62 +286,137 @@ def room(room: Room):
         return HTTPException(status_code=500, detail=str(e))
     
 @app.post("/updateroom")
-def update_room(room: Room):
-    try:
-        # Check if the room exists in the database
-        check_query = "SELECT * FROM room WHERE RoomID = %s"
-        check_values = (room.RoomID,)
-        cursor.execute(check_query, check_values)
-        existing_room = cursor.fetchone()
+def update_room(
+    user_type: str = Depends(get_user_type)
+):
+    if user_type != "admin":
+        raise HTTPException(status_code=403, detail="Permission denied. Only admins can access this endpoint.")
 
-        if existing_room:
-            # Update the room data in the MySQL database
-            update_query = "UPDATE room SET RoomName = %s, RoomType = %s, Description = %s, Availability = %s WHERE RoomID = %s"
-            update_values = (room.RoomName, room.RoomType, room.Description, room.Availability, room.RoomID)
-            cursor.execute(update_query, update_values)
-            db.commit()
-            return {"message": f"Room {room.RoomID} updated successfully"}
-        else:
-            return HTTPException(status_code=404, detail=f"Room {room.RoomID} not found")
+    try:
+        # Update room data in the MySQL database
+        query = "UPDATE room SET RoomName = %s, RoomType = %s, Description = %s, Availability = %s WHERE RoomID = %s"
+        values = (Room.RoomName, Room.RoomType, Room.Description, Room.Availability, Room.RoomID)
+        cursor.execute(query, values)
+        db.commit()
+        return {"message": "Room updated successfully"}
     except Exception as e:
         return HTTPException(status_code=500, detail=str(e))
-
+    
 @app.post("/deleteroom")
-def delete_room(room_id: int):
+def delete_room(
+    user_type: str = Depends(get_user_type)
+):
+    if user_type != "admin":
+        raise HTTPException(status_code=403, detail="Permission denied. Only admins can access this endpoint.")
     try:
-        # Check if the room exists in the database
-        check_query = "SELECT * FROM room WHERE RoomID = %s"
-        check_values = (room_id,)
-        cursor.execute(check_query, check_values)
-        existing_room = cursor.fetchone()
-
-        if existing_room:
-            # Delete the room from the MySQL database
-            delete_query = "DELETE FROM room WHERE RoomID = %s"
-            delete_values = (room_id,)
-            cursor.execute(delete_query, delete_values)
-            db.commit()
-            return {"message": f"Room {room_id} deleted successfully"}
-        else:
-            return HTTPException(status_code=404, detail=f"Room {room_id} not found")
+        # Delete room data from the MySQL database
+        query = "DELETE FROM room WHERE RoomID = %s"
+        values = (Room.RoomID)
+        cursor.execute(query, values)
+        db.commit()
+        return {"message": "Room deleted successfully"}
     except Exception as e:
         return HTTPException(status_code=500, detail=str(e))
     
 @app.get("/showroom")
-def rooms(current_user: User = Depends(get_current_user)):
+def show_room():
     try:
-        # Get all users from the MySQL database
         query = "SELECT * FROM room"
         cursor.execute(query)
         result = cursor.fetchall()
-
-        # Check if the current user has permission to access the endpoint
-        if current_user.Username == "admin":
-            return result
-        else:
-            return HTTPException(status_code=403, detail="Permission denied")
+        return result
     except Exception as e:
         return HTTPException(status_code=500, detail=str(e))
+
+    
+@app.post("/bookroom")
+def book_room(
+    current_user: dict = Depends(get_current_user),
+    user_type: str = Depends(get_user_type)
+):
+    if user_type == "user":
+        try:
+            # Insert booking data into the MySQL database
+            query = "INSERT INTO booking (UserID, RoomID, AdminID, StartTime, EndTime, Status, Timestamp) VALUES (%s, %s, %s, %s, %s, %s, %s)"
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            values = ( current_user['user_details']['UserID'], Booking.RoomID, None, Booking.StartTime, Booking.EndTime, 'Pending',  timestamp )
+            cursor.execute(query, values)
+            db.commit()
+            return {"message": "New Room Booking created successfully by User"}
+        except Exception as e:
+            return HTTPException(status_code=500, detail=str(e))
+    elif user_type == "admin":
+        try:
+        # Insert booking data into the MySQL database
+            query = "INSERT INTO booking (UserID, RoomID, AdminID, StartTime, EndTime, Status, Timestamp) VALUES (%s, %s, %s, %s, %s, %s, %s)"
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            values = (Booking.UserID, Booking.RoomID, current_user['user_details']['AdminID'], Booking.StartTime, Booking.EndTime, 'Pending',  timestamp)
+            cursor.execute(query, values)
+            db.commit()
+            return {"message": "New Room Booking created successfully by Admin"}
+        except Exception as e:
+            return HTTPException(status_code=500, detail=str(e))
+        
+@app.post("/cancelbook")
+def cancel_book(
+    user_type: str = Depends(get_user_type)
+):
+    if user_type == "user":
+        try:
+            # Update booking data and insert data into CANCELLATION table in the MySQL database
+            query = """
+            UPDATE booking SET Status = %s WHERE BookingID = %s;
+            INSERT INTO CANCELLATION (BookingID, Timestamp) VALUES (%s, %s);
+            """
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            values = ('Cancelled', Cancellation.BookingID, Cancellation.BookingID, timestamp)
+            cursor.execute(query, values)
+            db.commit()
+            return {"message": "Room Booking cancelled successfully by User"}
+        except Exception as e:
+            return HTTPException(status_code=500, detail=str(e))
+    elif user_type == "admin":
+        try:
+            # Update booking data in the MySQL database
+            query = """
+            UPDATE booking SET Status = %s WHERE BookingID = %s;
+            INSERT INTO CANCELLATION (BookingID, Timestamp) VALUES (%s, %s);
+            """
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            values = ('Cancelled', Cancellation.BookingID, Cancellation.BookingID, timestamp)
+            cursor.execute(query, values)
+            db.commit()
+            return {"message": "Room Booking cancelled successfully by Admin"}
+        except Exception as e:
+            return HTTPException(status_code=500, detail=str(e))
+    
+    
+@app.get("/showbookings")
+def show_bookings(
+    current_user: dict = Depends(get_current_user),
+    user_type: str = Depends(get_user_type)
+):
+    if user_type == "admin":
+        # Display all room bookings for admin
+        try:
+            query = "SELECT * FROM booking"
+            cursor.execute(query)
+            result = cursor.fetchall()
+            return result
+        except Exception as e:
+            return HTTPException(status_code=500, detail=str(e))
+    elif user_type == "user":
+        # Display only the room bookings for the current user
+        try:
+            user_id = current_user['user_details']['UserID']
+            query = "SELECT * FROM booking WHERE UserID = %s"
+            cursor.execute(query, (user_id,))
+            result = cursor.fetchall()
+            return result
+        except Exception as e:
+            return HTTPException(status_code=500, detail=str(e))
+    else:
+        return HTTPException(status_code=401, detail="Invalid user type")
 
 @app.get("/")
 async def root():
