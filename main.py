@@ -1,8 +1,6 @@
-# still have issue with /confirmbook /cancelbook /removebook
 from fastapi import FastAPI, HTTPException, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from fastapi.security import OAuth2PasswordBearer
 from typing import Optional
 import mysql.connector
 from typing import Union
@@ -31,9 +29,6 @@ db = mysql.connector.connect(**db_config)
 
 cursor = db.cursor(dictionary=True)
 
-# OAuth2PasswordBearer for authentication
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
-
 
 class User(BaseModel):
     FirstName: str
@@ -61,14 +56,8 @@ class Room(BaseModel):
     RoomName: str
     RoomType: str
     Description: str
-    Availability: bool
 
-class BookingUser(BaseModel):
-    RoomID: int
-    StartTime: str
-    EndTime: str
-
-class BookingAdmin(BaseModel):
+class Booking:
     UserID: int
     RoomID: int
     StartTime: str
@@ -83,27 +72,13 @@ class Warning(BaseModel):
 
 global usertypecheck, currentuserid, currentadminid
 
-# to def get_current_user 
-def authenticate_user(username: str, password: str, user_type: str): 
-    # Check if the provided username and password match a user in the specified database
-    check_query = "SELECT * FROM {} WHERE Username = %s AND Password = %s".format(user_type)
-    check_values = (username, password)
-    cursor.execute(check_query, check_values)
-    user = cursor.fetchone()
-
-    print(f"User Type: {user_type}")
-
-    if user:
-        return user_type  # Return the user type (admin or user)
-    return None
-
-# to async def get_user_type
+# to async def get_user_type for signout
 def extract_user_type(authorization: str) -> str:
     # Extract the user type from the authorization header
     user_type = authorization.split(" ")[0]
     return user_type
 
-# to def get_current_user, @app.post("/logout")
+# to def  @app.post("/signout")
 async def get_user_type(authorization: Optional[str] = Header(None)):
     if authorization is None:
         raise HTTPException(status_code=401, detail="Unauthorized")
@@ -115,24 +90,6 @@ async def get_user_type(authorization: Optional[str] = Header(None)):
 
     return user_type
     #return admin or user
-
-# to @app.post("/signupadmin"), @app.get("/showuser"), @app.get("/showroom")
-# Dependency to check if the request is coming from a valid admin
-def get_current_user(user_type: str = Depends(get_user_type), login_data: UserLogin = Depends()):
-    username = login_data.Username
-    password = login_data.Password
-
-    if user_type == "admin":
-        admin_auth = authenticate_user(username, password, "admin")
-        if admin_auth:
-            return {"user_type": "admin", "user_details": admin_auth[1]}
-    elif user_type == "user":
-        user_auth = authenticate_user(username, password, "user")
-        if user_auth:
-            return {"user_type": "user", "user_details": user_auth[1]}
-        
-    raise HTTPException(status_code=401, detail="Invalid credentials")
-    #from get_user_type, authenicate_user, return admin or user in details
 
 @app.post("/signout")
 def remove_current_user():
@@ -301,8 +258,8 @@ def add_room(room: dict):
 
     try:
         # Insert room data into the MySQL database
-        query = "INSERT INTO room (AdminID, RoomName, RoomType, Description, Availability) VALUES (%s, %s, %s, %s, %s)"
-        values = (room.get('AdminID'), room.get('RoomName'), room.get('RoomType'), room.get('Description'), '1')
+        query = "INSERT INTO room (AdminID, RoomName, RoomType, Description) VALUES (%s, %s, %s, %s)"
+        values = (int(currentadminid), room.get('RoomName'), room.get('RoomType'), room.get('Description'))
 
         cursor.execute(query, values)
         db.commit()
@@ -311,6 +268,7 @@ def add_room(room: dict):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     
+# You can choose to edit some attribute or every attr.
 @app.post("/updateroom")
 def update_room(room: dict):
     global usertypecheck
@@ -334,17 +292,12 @@ def update_room(room: dict):
             query += "Description = %s, "
             update_values.append(room.get('Description'))
 
-        if room.get('Availability'):
-            query += "Availability = %s, "
-            update_values.append(room.get('Availability'))
-
         # Remove the trailing comma and space
         query = query.rstrip(', ')
 
         # Add the WHERE clause
         query += " WHERE RoomID = %s"
         update_values.append(room.get('RoomID'))
-
         cursor.execute(query, update_values)
         db.commit()
         return {"message": "Room updated successfully"}
@@ -378,9 +331,7 @@ def show_room():
         return HTTPException(status_code=500, detail=str(e))
 
 @app.post("/bookroom")
-async def book_room(
-    booking: Union[BookingUser, BookingAdmin],
-):
+async def book_room( booking: dict):
     global usertypecheck, currentadminid, currentuserid
 
     try:
@@ -390,10 +341,10 @@ async def book_room(
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
         if usertypecheck == "user":
-            values_user = (int(currentuserid), booking.RoomID, booking.StartTime, booking.EndTime, 'Pending', timestamp)
+            values_user = (int(currentuserid), booking.get('RoomID'), booking.get('StartTime'), booking.get('EndTime'), 'Pending', timestamp)
             cursor.execute(query_user, values_user)
         elif usertypecheck == "admin":
-            values_admin = (booking.UserID, booking.RoomID, int(currentadminid), booking.StartTime, booking.EndTime, 'Pending', timestamp)
+            values_admin = (booking.get('UserID'), booking.get('RoomID'), int(currentadminid), booking.get('StartTime'), booking.get('EndTime'), 'Pending', timestamp)
             cursor.execute(query_admin, values_admin)
 
         db.commit()
@@ -401,31 +352,33 @@ async def book_room(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     
-@app.post("/confirmbook") #not completed
-async def confirm_book(booking: Union[BookingUser, BookingAdmin]):
+@app.post("/confirmbook")
+async def confirm_book(booking: dict):
     global usertypecheck
     if usertypecheck == "admin":
         try:
             # Update booking data in the MySQL database
             query = "UPDATE booking SET Status = %s WHERE BookingID = %s"
-            values = ('Confirmed', booking.BookingID)
-            cursor.execute(query, values)
+            update_values = ["Confirmed", booking.get('BookingID')]
+
+            cursor.execute(query, update_values)
             db.commit()
             return {"message": "Room Booking confirmed successfully by Admin"}
         except Exception as e:
             return HTTPException(status_code=500, detail=str(e))
     else:
         return HTTPException(status_code=401, detail="Invalid user type")
-    
-@app.post("/removebook") ## not completed
-async def remove_book(booking: Union[BookingUser, BookingAdmin]):
+
+@app.post("/removebook") 
+async def remove_book(booking: dict):
     global usertypecheck
     if usertypecheck == "admin":
         try:
             # Update booking data in the MySQL database
             query = "UPDATE booking SET Status = %s WHERE BookingID = %s"
-            values = ('Removed by Admin', booking.BookingID)
-            cursor.execute(query, values)
+            update_values = ["Removed by Admin", booking.get('BookingID')]
+
+            cursor.execute(query, update_values)
             db.commit()
             return {"message": "Room Booking removed successfully by Admin"}
         except Exception as e:
@@ -433,39 +386,67 @@ async def remove_book(booking: Union[BookingUser, BookingAdmin]):
     else:
         return HTTPException(status_code=401, detail="Invalid user type")
         
-@app.post("/cancelbook") ## not completed
-def cancel_book(cancellation: Cancellation):
+@app.post("/cancelbook")
+async def cancel_book(cancellation: Cancellation):
     global usertypecheck
     if usertypecheck == "user":
         try:
-            # Update booking data and insert data into CANCELLATION table in the MySQL database
-            query = """
-            UPDATE booking SET Status = %s WHERE BookingID = %s;
-            INSERT INTO CANCELLATION (BookingID, Timestamp) VALUES (%s, %s);
-            """
-            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            values = ('Cancelled', cancellation.BookingID, cancellation.BookingID, timestamp)
-            cursor.execute(query, values)
+            # Start a transaction
+            db.start_transaction()
+
+            # Update booking data in the MySQL database
+            query_booking = "UPDATE booking SET Status = %s WHERE BookingID = %s"
+            update_values_booking = ["Cancelled by User", cancellation.BookingID]
+            db.cursor().execute(query_booking, update_values_booking)
+
+            # Insert data into the CANCELLATION table
+            query_cancellation = "INSERT INTO CANCELLATION (BookingID, Timestamp) VALUES (%s, NOW())"
+            values_cancellation = [cancellation.BookingID]
+            db.cursor().execute(query_cancellation, values_cancellation)
+
+            # Commit the transaction
             db.commit()
+
             return {"message": "Room Booking cancelled successfully by User"}
         except Exception as e:
+            # Rollback in case of an exception
+            db.rollback()
             return HTTPException(status_code=500, detail=str(e))
+        finally:
+            # Close the cursor
+            db.cursor().close()
+            # Close the connection
+            db.close()
+
     elif usertypecheck == "admin":
         try:
+            # Start a transaction
+            db.start_transaction()
+
             # Update booking data in the MySQL database
-            query = """
-            UPDATE booking SET Status = %s WHERE BookingID = %s;
-            INSERT INTO CANCELLATION (BookingID, Timestamp) VALUES (%s, %s);
-            """
-            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            values = ('Cancelled', cancellation.BookingID, cancellation.BookingID, timestamp)
-            cursor.execute(query, values)
+            query_booking = "UPDATE booking SET Status = %s WHERE BookingID = %s"
+            update_values_booking = ["Cancelled by Admin", cancellation.BookingID]
+            db.cursor().execute(query_booking, update_values_booking)
+
+            # Insert data into the CANCELLATION table
+            query_cancellation = "INSERT INTO CANCELLATION (BookingID, Timestamp) VALUES (%s, NOW())"
+            values_cancellation = [cancellation.BookingID]
+            db.cursor().execute(query_cancellation, values_cancellation)
+
+            # Commit the transaction
             db.commit()
+
             return {"message": "Room Booking cancelled successfully by Admin"}
         except Exception as e:
+            # Rollback in case of an exception
+            db.rollback()
             return HTTPException(status_code=500, detail=str(e))
-    
-    
+        finally:
+            # Close the cursor
+            db.cursor().close()
+            # Close the connection
+            db.close()
+
 @app.get("/showbookings")
 def show_bookings():
     global usertypecheck, currentuserid, currentadminid
